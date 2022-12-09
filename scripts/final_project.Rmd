@@ -2,7 +2,7 @@
 title: "final_project_654"
 author: "Errol Kaylor"
 date: "`r Sys.Date()`"
-output: html_document
+output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
@@ -16,12 +16,17 @@ library(caret)
 library(vip)
 library(cutpointr)
 library(finalfit)
+library(knitr)
 ```
 Goal is to predict player ratings based on turns data! 
 
 Link to data: https://www.kaggle.com/competitions/scrabble-player-rating/data
 
-Research questions: Can you predict player rating based on move value, time control name, game winner, and game duration, game creation, and lexicon?
+Link to github repo: https://github.com/errolkaylor/654_edld_fp_scrabble
+
+## Project Intro
+Our goal here is to understand how well we can predict player scrabble ratings based on online gameplay against computer opponents! Scrabble ratings are measures of relative scrabble skill of players, with a median score of tournament player being roughly 1200. Predicting player ratings is an important scrabble tournament problem, as creating fair divisons for competition is of the utmost importance. These models may also lead to simpler ELO calculations for players, as it is a relatively involved statistic to calculate for each player.
+
 ```{r initial data setup}
 games <- import(here("data/games.csv/games.csv")) %>% 
     as_tibble()
@@ -48,6 +53,23 @@ games_train_fuller <- games_train_full %>%
     select(-c(14,16,18)) %>% 
     relocate(rating,.after = winner_type) %>% 
     mutate(game_end_reason = as_factor(game_end_reason))
+
+games_test_full <- games %>% 
+    left_join(test) %>% 
+    filter(!(first==nickname)) %>% 
+    mutate(second_player=nickname) %>% 
+    separate(col=created_at,sep = " ",into = c("date","time")) %>% 
+    separate(col=date,sep="-",into = c("year","month","day")) %>% 
+    separate(col=time,sep=":",into = c("hour","minute","second")) %>% 
+    mutate_at(c(6:11),as.numeric)
+
+games_test_fuller <- games_test_full %>% 
+    mutate(game_winner = if_else(winner==1,second_player,first),
+           winner_type = if_else(game_winner %in% c("BetterBot","STEEBot","HastyBot"),"Bot","Human")) %>% 
+    select(-c(14,16,18)) %>% 
+    relocate(rating,.after = winner_type) %>% 
+    mutate(game_end_reason = as_factor(game_end_reason)) %>% 
+    filter(!is.na(rating))
 
 outcome <- c('rating')
 
@@ -79,6 +101,13 @@ blueprint_games <- recipe(x=games_train_fuller,
 
 
 ```
+Our dataset consists of game, player rating, and turn data for ~73,000 scrabble games played against bots on woogles.io. 
+For game, we are given a game id, player names, which player won and went first, game creation time and date, and the dictionary ("Lexicon") being used in the particular game. 
+Additionally, we are given test and training datasets with game ids, player scores, and player ratings before the game is played.
+Finally, we have turn data for each scrabble game played, that includes infomration on current player score, player move type, player points scored (if points were scored with the move), where the player put their tiles, and what tiles they have in their rack. I used player rack to calculate a new metric, rack score. This metric is the total point value of tiles in the players rack before each move, and is used in comparison to points scored each turn to provide more evidence for scrabble skill. 
+
+
+
 
 ```{r model one}
 games_train_fuller = games_train_fuller[sample(nrow(games_train_fuller)),]   
@@ -105,7 +134,7 @@ mod_1 <- caret::train(blueprint_games,
                                               lambda = seq(0.0001,1,length = 20)),
                       trControl = cv)
 
-mod_1
+#mod_1
 
 vip(mod_1,num_features = 5, geom = "point") +
     theme_bw()
@@ -139,11 +168,14 @@ games_turns_combo <- games_train_fuller %>%
     filter(is.finite(avg_prop_points_scored ))
 
 
+games_test_turns_combo <- games_test_fuller %>% 
+    left_join(turns_summary) %>% 
+    relocate(rating,.after = avg_points_scored) %>% 
+    filter(is.finite(avg_prop_points_scored ))
+
+
 ```
 
-#Modify turns data w/ rack worth, proportion rack value to points scored
-
-#Going back, having fun!
 ```{r model 2}
 numeric_updated <- c('game_duration_seconds','score','avg_prop_points_scored','avg_points_scored')
 
@@ -189,7 +221,7 @@ mod_2 <- caret::train(blueprint_games_turns_combo,
                                               lambda = seq(0.0001,1,length = 20)),
                       trControl = cv)
 
-mod_2
+#mod_2
 
 vip(mod_2,num_features = 10, geom = "point") +
     theme_bw()
@@ -233,16 +265,61 @@ ggplot()+
 
 nbags[which.min(rmses)]
 
+predicted_te_mod1 <- predict(mod_1,games_test_turns_combo)
 
-predicted_te <- predict(bags[[11]],ind_te)
+predicted_te_mod2 <- predict(mod_2,games_test_turns_combo)
+
+
+
+
+predicted_te <- predict(bags[[14]],games_test_turns_combo)
+
+
+
 # MAE
-mean(abs(ind_te$id_overall - predicted_te))
+rf_mae <- mean(abs(games_test_turns_combo$rating - predicted_te))
 # RMSE
-sqrt(mean((ind_te$id_overall - predicted_te)^2))
+rf_rmse <- sqrt(mean((games_test_turns_combo$rating - predicted_te)^2))
 # R-square
-cor(ind_te$id_overall,predicted_te)^2
+rf_rsq <- cor(games_test_turns_combo$rating,predicted_te)^2
+
+# MAE
+mod1_mae <- mean(abs(games_test_turns_combo$rating - predicted_te_mod1))
+# RMSE
+mod1_rmse <- sqrt(mean((games_test_turns_combo$rating - predicted_te_mod1)^2))
+# R-square
+mod1_rsq <- cor(games_test_turns_combo$rating,predicted_te_mod1)^2
+
+# MAE
+mod2_mae <- mean(abs(games_test_turns_combo$rating - predicted_te_mod2))
+# RMSE
+mod2_rmse <- sqrt(mean((games_test_turns_combo$rating - predicted_te_mod2)^2))
+# R-square
+mod2_rsq <- cor(games_test_turns_combo$rating,predicted_te_mod2)^2
+
+
+
+agg_perf <- c("Pure Game Data","Added Turn Data","Random Forest") %>% 
+    as_tibble() %>% 
+    mutate(rsq = c(mod1_rsq,mod2_rsq,rf_rsq),
+           rmse = c(mod1_rmse,mod2_rmse,rf_rmse),
+           mae = c(mod1_mae,mod2_mae,rf_mae))
+
+kable(agg_perf,digits = 3)
 ```
-```{r}
-new <- "new"
+
+I ran a series of three models on our scrabble data, being two elasticnet penalized regressions (varying both our alpha and lambda values  from 0-1 for optimizing our model) and a random forest model using the ranger function. Our initial model is predicting player ratings without using any turn metadata, and performs poorly as a result, with rsq = .546, RMSE = 136.7, and MAE = 110.773.
+
+Including turn metadata slightly improved the performance of our model as we can see with model 2 but not significantly. Our rsq rises and RMSE and MAE drop slightly respectively, with values of .59, 133.15, and 107.57 respectively.
+
+The final random forest model outperformed both our elasticnet regressions, with rsq = .648, RMSE = 119.95, and MAE = 96.36
+
+```{r rf model analysis}
+
+vip(bags[[14]],num_features = 10, geom = "point") +
+    theme_bw()
+
 ```
+
+From an intial feature analysis, our random forest model is aso the most promising, as it values features that make intuitive sense - our average points scored, average proportion of points scored, player score, and how long the game took. 
 
