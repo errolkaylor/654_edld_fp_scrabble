@@ -1,0 +1,248 @@
+---
+title: "final_project_654"
+author: "Errol Kaylor"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rio)
+library(here)
+library(tidyverse)
+library(janitor)
+library(recipes)
+library(caret)
+library(vip)
+library(cutpointr)
+library(finalfit)
+```
+Goal is to predict player ratings based on turns data! 
+
+Link to data: https://www.kaggle.com/competitions/scrabble-player-rating/data
+
+Research questions: Can you predict player rating based on move value, time control name, game winner, and game duration, game creation, and lexicon?
+```{r initial data setup}
+games <- import(here("data/games.csv/games.csv")) %>% 
+    as_tibble()
+test <- import(here("data/test.csv/test.csv")) %>% 
+    as_tibble()
+train <- import(here("data/train.csv/train.csv")) %>% 
+    as_tibble()
+turns <- import(here("data/turns.csv/turns.csv")) %>% 
+    as_tibble() 
+#add player names to games data
+
+games_train_full <- games %>% 
+    left_join(train) %>% 
+    filter(!(first==nickname)) %>% 
+    mutate(second_player=nickname) %>% 
+    separate(col=created_at,sep = " ",into = c("date","time")) %>% 
+    separate(col=date,sep="-",into = c("year","month","day")) %>% 
+    separate(col=time,sep=":",into = c("hour","minute","second")) %>% 
+    mutate_at(c(6:11),as.numeric)
+
+games_train_fuller <- games_train_full %>% 
+    mutate(game_winner = if_else(winner==1,second_player,first),
+           winner_type = if_else(game_winner %in% c("BetterBot","STEEBot","HastyBot"),"Bot","Human")) %>% 
+    select(-c(14,16,18)) %>% 
+    relocate(rating,.after = winner_type) %>% 
+    mutate(game_end_reason = as_factor(game_end_reason))
+
+outcome <- c('rating')
+
+id      <- c('game_id')
+
+categorical <- c('time_control_name','game_end_reason','lexicon','rating_mode','winner_type')
+
+numeric <- c('game_duration_seconds','score')
+
+cyclic <- c('day','month','hour','minute','second')
+
+
+blueprint_games <- recipe(x=games_train_fuller,
+                          vars=c(id,outcome,categorical,numeric,cyclic),
+                          roles=c('id','outcome',rep('predictor',12))) %>% 
+    step_harmonic('month',frequency = 1,cycle_size=3,role='predictor') %>%
+    step_harmonic('day',frequency = 1,cycle_size=31,role='predictor') %>%
+    step_harmonic('hour',frequency = 1,cycle_size=12,role='predictor') %>%
+    step_harmonic('minute',frequency = 1,cycle_size=60,role='predictor') %>%
+    step_harmonic('second',frequency = 1,cycle_size=60,role='predictor') %>%
+    step_dummy('lexicon',one_hot = TRUE) %>% 
+    step_dummy('time_control_name',one_hot=TRUE) %>%
+    step_dummy('winner_type',one_hot=TRUE) %>% 
+    step_dummy('rating_mode',one_hot=TRUE) %>% 
+    step_dummy('game_end_reason',one_hot=TRUE) %>% 
+    step_normalize('game_duration_seconds') %>% 
+    step_normalize('score') %>% 
+    step_normalize(c('month_sin_1','day_sin_1','hour_sin_1','minute_sin_1','second_sin_1','month_cos_1','day_cos_1','hour_cos_1','minute_cos_1','second_cos_1'))
+
+
+```
+
+```{r model one}
+games_train_fuller = games_train_fuller[sample(nrow(games_train_fuller)),]   
+
+folds1 = cut(seq(1,nrow(games_train_fuller)),breaks=10,labels=FALSE)
+  
+# Create the list for each fold 
+      
+my.indices1 <- vector('list',10)
+
+for(i in 1:10){
+    my.indices1[[i]] <- which(folds1!=i)
+}
+cv <- trainControl(method          = "cv",
+                   index           = my.indices1)
+
+
+ff_glimpse(games_train_fuller)
+
+mod_1 <- caret::train(blueprint_games,
+                      data=games_train_fuller,
+                      method='glmnet',
+                      tuneGrid = expand.grid( alpha = seq(0.0001,1,length = 20),
+                                              lambda = seq(0.0001,1,length = 20)),
+                      trControl = cv)
+
+mod_1
+
+vip(mod_1,num_features = 5, geom = "point") +
+    theme_bw()
+```
+
+
+```{r adding rack value predictors}
+rack_val <- function(rack_string){
+                one <- str_count(rack_string,"[AEIOULNSTR]")
+                two <- str_count(rack_string,"[DG]")*2
+                three <- str_count(rack_string,"[BCMP]")*3
+                four <-  str_count(rack_string,"[FHVWY]")*4
+                five <-  str_count(rack_string,"[K]")*5
+                six <-  str_count(rack_string,"[JX]")*8
+                seven <- str_count(rack_string,"[QZ]")*10
+                sum <- one + two + three + four + five + six + seven
+}
+
+turns <- turns %>% 
+    mutate(rack_values = rack_val(rack),
+           proportion_points_scored = points/rack_values)
+
+turns_summary <- turns %>% 
+    group_by(game_id) %>% 
+    summarize(avg_prop_points_scored = mean(proportion_points_scored,na.rm=TRUE),
+              avg_points_scored = mean(points,na.rm=TRUE))
+
+games_turns_combo <- games_train_fuller %>% 
+    left_join(turns_summary) %>% 
+    relocate(rating,.after = avg_points_scored) %>% 
+    filter(is.finite(avg_prop_points_scored ))
+
+
+```
+
+#Modify turns data w/ rack worth, proportion rack value to points scored
+
+#Going back, having fun!
+```{r model 2}
+numeric_updated <- c('game_duration_seconds','score','avg_prop_points_scored','avg_points_scored')
+
+
+blueprint_games_turns_combo <- recipe(x=games_turns_combo,
+                          vars=c(id,outcome,categorical,numeric_updated,cyclic),
+                          roles=c('id','outcome',rep('predictor',14))) %>% 
+    step_harmonic('month',frequency = 1,cycle_size=3,role='predictor') %>%
+    step_harmonic('day',frequency = 1,cycle_size=31,role='predictor') %>%
+    step_harmonic('hour',frequency = 1,cycle_size=12,role='predictor') %>%
+    step_harmonic('minute',frequency = 1,cycle_size=60,role='predictor') %>%
+    step_harmonic('second',frequency = 1,cycle_size=60,role='predictor') %>%
+    step_dummy('lexicon',one_hot = TRUE) %>% 
+    step_dummy('time_control_name',one_hot=TRUE) %>%
+    step_dummy('winner_type',one_hot=TRUE) %>% 
+    step_dummy('rating_mode',one_hot=TRUE) %>% 
+    step_dummy('game_end_reason',one_hot=TRUE) %>% 
+    step_normalize('game_duration_seconds') %>% 
+    step_normalize('score') %>% 
+    step_normalize('avg_points_scored') %>% 
+    step_normalize('avg_prop_points_scored') %>% 
+    step_normalize(c('month_sin_1','day_sin_1','hour_sin_1','minute_sin_1','second_sin_1','month_cos_1','day_cos_1','hour_cos_1','minute_cos_1','second_cos_1'))
+
+games_turns_combo = games_turns_combo[sample(nrow(games_turns_combo)),]   
+
+folds2 = cut(seq(1,nrow(games_turns_combo)),breaks=10,labels=FALSE)
+  
+# Create the list for each fold 
+      
+my.indices2 <- vector('list',10)
+
+for(i in 1:10){
+    my.indices2[[i]] <- which(folds2!=i)
+}
+cv <- trainControl(method          = "cv",
+                   index           = my.indices2)
+
+
+mod_2 <- caret::train(blueprint_games_turns_combo,
+                      data=games_turns_combo,
+                      method='glmnet',
+                      tuneGrid = expand.grid( alpha = seq(0.0001,1,length = 20),
+                                              lambda = seq(0.0001,1,length = 20)),
+                      trControl = cv)
+
+mod_2
+
+vip(mod_2,num_features = 10, geom = "point") +
+    theme_bw()
+
+```
+
+```{r random forest model 3}
+rangergrid <- expand.grid(
+    .mtry=10,
+    .splitrule='variance',
+    .min.node.size=2)
+
+nbags <- c(seq(5,200,15))
+
+bags<- vector('list',length(nbags))
+
+for(i in 1:length(nbags)){
+    bags[[i]] <- caret::train(blueprint_games_turns_combo,
+                              data = games_turns_combo,
+                              method = 'ranger',
+                              tuneGrid = rangergrid,
+                              trControl = cv,
+                              num.trees = nbags[i],
+                              importance = 'impurity',
+                              max.depth = 50)
+}
+```
+
+```{r model fit statistics}
+rmses <- c()
+for(i in 1:length(nbags)){
+  
+  rmses[i] = bags[[i]]$results$RMSE
+  
+}
+ggplot()+
+  geom_line(aes(x=nbags,y=rmses))+
+  xlab('Number of Trees')+
+  ylab('RMSE')
+
+
+nbags[which.min(rmses)]
+
+
+predicted_te <- predict(bags[[11]],ind_te)
+# MAE
+mean(abs(ind_te$id_overall - predicted_te))
+# RMSE
+sqrt(mean((ind_te$id_overall - predicted_te)^2))
+# R-square
+cor(ind_te$id_overall,predicted_te)^2
+```
+```{r}
+new <- "new"
+```
+
